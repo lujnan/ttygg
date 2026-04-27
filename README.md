@@ -54,18 +54,49 @@ Stack several exclude rules; a line is hidden if it matches **any** pattern:
   -L session.log
 ```
 
+With `-e`, `session.log` gets **filtered** RX by default (same as the screen). To record **full** RX in the file while still filtering the terminal, add **`--log-full-rx`**:
+
+```bash
+./build/ttygg -p /dev/ttyUSB0 -b 921600 -e '^\[DBG\]' --log-full-rx -L session.log
+```
+
 Full options and behaviour notes:
 
 ```bash
 ./build/ttygg --help
 ```
 
-## Exiting
+## Logging
 
-ttygg uses a **prefix + quit** sequence (picocom-style):
+Use **`-L` / `--log FILE`** to append traffic to a file as **escaped text** (non-printables escaped, newline-terminated records). **Keyboard TX** (what you type toward the serial port) is always logged in full. **Serial RX** in the file depends on filtering:
 
-1. Press **Ctrl+A** once (this is the prefix; it is **not** sent to the serial port by itself).
-2. Then press **Ctrl+Q** or **Ctrl+X** to quit the program.
+| Mode | RX in log file |
+|------|----------------|
+| No `-e` | Same as stdout: raw RX stream. |
+| With `-e` (default) | Matches the **terminal**: only lines/chunks that are **not** dropped by `--exclude` are written to the log. |
+| With `-e` and `--log-full-rx` | Full **RX wire** in the file; `--exclude` applies only to stdout, not to logged RX. |
+
+**Without `-L`:** no log file is created until you use the hotkey below. After the first **Ctrl+A** then **Ctrl+L**, logging uses an auto-generated name in the current directory.
+
+**With `-L path`:** logging starts immediately, appending to `path`. Each **Ctrl+A** then **Ctrl+L** closes the current log and opens a **new** file. New files are named:
+
+`{stem}_{n}_{YYYYMMDDHHMMSS}.log`
+
+- **`n`** starts from 0 and increases each time; if that name already exists, `n` is bumped until `open(2)` succeeds (`O_EXCL`).
+- **`YYYYMMDDHHMMSS`** is local time (14 digits).
+- **Without `-L`:** `stem` is **`ttygg`** (working directory).
+- **With `-L`:** directory and `stem` come from `path` (e.g. `logs/capture.log` → `logs/capture_0_20260427143022.log`). A trailing `.log` on the basename is stripped for `stem`.
+
+You can rotate the log multiple times in one session; each **Ctrl+A**, **Ctrl+L** starts a fresh file.
+
+## Exiting and log hotkeys
+
+ttygg uses a **Ctrl+A prefix** (picocom-style). The prefix alone is **not** sent to the serial port.
+
+| After Ctrl+A | Action |
+|--------------|--------|
+| **Ctrl+Q** or **Ctrl+X** | Quit ttygg. |
+| **Ctrl+L** | Start a new log file (see [Logging](#logging)). |
 
 To send a **literal byte 0x01** to the device (e.g. some firmware uses Ctrl+A), press **Ctrl+A** twice in a row: the first is the prefix, the second is forwarded as `0x01`.
 

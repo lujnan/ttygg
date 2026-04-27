@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <regex>
 #include <string>
@@ -39,10 +40,13 @@ struct Options {
   bool verbose = false;
   /// Do not flush partial serial buffer on poll timeout (safer for nsh; long lines without \\n wait for more data).
   bool no_idle_flush = false;
-  /// If non-empty, append a text log of wire TX/RX (see --log).
+  /// If non-empty, append a text log of wire TX/RX (see --log) from startup. If empty, no log file is
+  /// opened until the first Ctrl+A Ctrl+L (see run_monitor).
   std::string log_path;
   /// Echo a copy of bytes we send to the serial to stdout (see --local-echo).
   bool local_echo = false;
+  /// With -e: if false (default), RX in the log file matches terminal (--exclude applies). If true, log full RX wire.
+  bool log_full_rx_wire = false;
 };
 
 struct LocalTermiosGuard {
@@ -168,16 +172,22 @@ void log_serial_wire(int log_fd, const void *p, size_t n) {
   (void)write_all(log_fd, line.data(), line.size());
 }
 
-struct LogFileGuard {
-  int fd;
-  explicit LogFileGuard(int f) : fd(f) {}
-  ~LogFileGuard() {
+struct ScopedLogFd {
+  int fd = -1;
+  ScopedLogFd() = default;
+  ~ScopedLogFd() {
     if (fd >= 0) {
       (void)close(fd);
     }
   }
-  LogFileGuard(const LogFileGuard &) = delete;
-  LogFileGuard &operator=(const LogFileGuard &) = delete;
+  void replace(int new_fd) {
+    if (fd >= 0) {
+      (void)close(fd);
+    }
+    fd = new_fd;
+  }
+  ScopedLogFd(const ScopedLogFd &) = delete;
+  ScopedLogFd &operator=(const ScopedLogFd &) = delete;
 };
 
 void print_help(const char *argv0) {
@@ -196,10 +206,15 @@ void print_help(const char *argv0) {
       << "      --local-echo        Also print to stdout a copy of everything sent to the serial (if the target does not echo).\n"
       << "  -v, --verbose           Trace run state to stderr. Env TTYGG_DEBUG=1 enables the same.\n"
       << "      --no-idle-flush     With -e: do not flush partial serial→stdout (neither after serial drain nor on poll timeout). TTYGG_NO_IDLE=1 same.\n"
-      << "  -L, --log FILE          Append wire traffic to FILE (escaped text; see previous versions for format).\n"
+      << "      --log-full-rx       With -e: write full serial RX to the log file; default is filtered (same as terminal).\n"
+      << "  -L, --log FILE          Append traffic to FILE (escaped text). With -e, RX in the file matches the screen by default.\n"
       << "\n"
       << "Stdin is a TTY: cbreak, no local echo, ISIG off, IXON off — each key goes to the port. Add --local-echo if blind.\n"
       << "Exit: Ctrl+A then Ctrl+Q or Ctrl+X (prefix, then quit). Double Ctrl+A sends one literal 0x01 to the port.\n"
+      << "Log: Ctrl+A then Ctrl+L starts a new wire log file: {name}_{n}_YYYYMMDDHHMMSS.log (n from 0, skip taken names).\n"
+      << "      With no -L, nothing is written to disk until the first Ctrl+A Ctrl+L; then name is ttygg in the current directory.\n"
+      << "      With -L PATH, logging starts in PATH immediately; Ctrl+A Ctrl+L uses name/dir from PATH (e.g. a/b/c.log -> a/b/c_n_....log).\n"
+      << "      With -e, use --log-full-rx to log full RX wire in the file (--exclude not applied to RX in file). TX is always full.\n"
       << "With -e, logical lines end on \\n for matching; \\r before \\n stripped. Partial flushes (line editing) run after each serial read batch. If a long line is split across USB reads, a matching exclude is tracked until a \\n so tails are not re-printed; rare false drops if unrelated text follows the same split.\n"
       << "Order: serial to the terminal is applied before the next key is sent, so nsh/line editing redraws stay aligned.\n"
       << "Non-TTY stdin: no cbreak; keyboard path is best-effort. High non-standard bauds use OS ioctls.\n";
@@ -281,6 +296,10 @@ bool parse_args(int argc, char **argv, Options *opt, std::string *err) {
         return false;
       }
       opt->log_path = argv[++i];
+      continue;
+    }
+    if (std::strcmp(a, "--log-full-rx") == 0) {
+      opt->log_full_rx_wire = true;
       continue;
     }
     *err = std::string("Unknown option: ") + a;
@@ -590,10 +609,83 @@ bool write_all(int fd, const char *data, size_t len) {
 static constexpr unsigned char kPicocomPrefix = 0x01;  /* ^A */
 static constexpr unsigned char kPicocomQuitQ = 0x11;  /* ^Q; IXON 会吞，已在 try_arm 关 */
 static constexpr unsigned char kPicocomQuitX = 0x18;  /* ^X */
+static constexpr unsigned char kPicocomLogRotate = 0x0c;  /* ^L: rotate wire log file */
+
+void split_dir_and_base(const std::string &path, std::string *dir_out, std::string *base_out) {
+  const size_t slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    *dir_out = ".";
+    *base_out = path;
+    return;
+  }
+  if (slash == 0) {
+    *dir_out = "/";
+    *base_out = path.substr(1);
+    return;
+  }
+  *dir_out = path.substr(0, slash);
+  *base_out = path.substr(slash + 1);
+}
+
+std::string log_stem_from_user_path(const std::string &base) {
+  static const char kSuffix[] = ".log";
+  constexpr size_t kLen = sizeof kSuffix - 1U;
+  if (base.size() > kLen && base.compare(base.size() - kLen, kLen, kSuffix) == 0) {
+    return base.substr(0, base.size() - kLen);
+  }
+  return base;
+}
+
+std::string join_log_dir_file(const std::string &dir, const std::string &filename) {
+  if (dir.empty() || dir == ".") {
+    return filename;
+  }
+  if (!dir.empty() && dir.back() == '/') {
+    return dir + filename;
+  }
+  return dir + "/" + filename;
+}
+
+std::string format_local_yyyymmddhhmmss() {
+  const std::time_t t = std::time(nullptr);
+  struct tm tm_local {};
+  if (localtime_r(&t, &tm_local) == nullptr) {
+    return "00000000000000";
+  }
+  char buf[16];
+  (void)std::snprintf(buf, sizeof buf, "%04d%02d%02d%02d%02d%02d", tm_local.tm_year + 1900,
+                      tm_local.tm_mon + 1, tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min,
+                      tm_local.tm_sec);
+  return std::string(buf);
+}
+
+/* O_EXCL: pick first free path; bump n on EEXIST. Returns fd >= 0 on success. */
+bool open_exclusive_numbered_log(const std::string &dir, const std::string &stem, unsigned start_n,
+                                 const std::string &timestamp, unsigned *used_n, int *out_fd,
+                                 std::string *out_path, std::string *err) {
+  for (unsigned n = start_n;; n++) {
+    const std::string name = stem + "_" + std::to_string(n) + "_" + timestamp + ".log";
+    const std::string path = join_log_dir_file(dir, name);
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd >= 0) {
+      *used_n = n;
+      *out_fd = fd;
+      *out_path = path;
+      return true;
+    }
+    if (errno != EEXIST) {
+      *err = std::strerror(errno);
+      return false;
+    }
+  }
+}
 
 bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n, bool *esc_pending,
-                                 bool *quit, bool local_echo) {
+                                 bool *quit, unsigned *rotate_log_requests, bool local_echo) {
   *quit = false;
+  if (rotate_log_requests != nullptr) {
+    *rotate_log_requests = 0;
+  }
   if (n == 0) {
     return true;
   }
@@ -623,6 +715,17 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
         }
         return true;
       }
+      if (c == kPicocomLogRotate) {
+        *esc_pending = false;
+        if (rotate_log_requests != nullptr) {
+          ++*rotate_log_requests;
+        }
+        if (log_fd >= 0 && !for_log.empty()) {
+          log_serial_wire(log_fd, for_log.data(), for_log.size());
+          for_log.clear();
+        }
+        continue;
+      }
       if (c == kPicocomPrefix) {
         const char lit = 0x01;
         if (!write_all(serfd, &lit, 1)) {
@@ -651,7 +754,7 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
 
 void write_filtered_line_to_stdout(const std::string &line,
                                     const std::vector<std::regex> &excludes,
-                                    bool *drop_continuation) {
+                                    bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log) {
   if (drop_continuation != nullptr && *drop_continuation) {
     *drop_continuation = false;
     return;
@@ -662,13 +765,16 @@ void write_filtered_line_to_stdout(const std::string &line,
   std::string out = line;
   out.push_back('\n');
   (void)write_all(STDOUT_FILENO, out.data(), out.size());
+  if (mirror_filtered_rx_to_log && log_fd >= 0) {
+    log_serial_wire(log_fd, out.data(), out.size());
+  }
 }
 
 /* Idle partial buffer: must NOT append \\n — that would split ANSI/UTF-8 mid-sequence and cause
  * replacement chars and a messed-up screen (e.g. after "clear"). */
 void write_filtered_chunk_to_stdout(const std::string &chunk,
                                    const std::vector<std::regex> &excludes,
-                                   bool *drop_continuation) {
+                                   bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log) {
   if (chunk.empty()) {
     return;
   }
@@ -693,10 +799,14 @@ void write_filtered_chunk_to_stdout(const std::string &chunk,
     return;
   }
   (void)write_all(STDOUT_FILENO, s.data(), s.size());
+  if (mirror_filtered_rx_to_log && log_fd >= 0) {
+    log_serial_wire(log_fd, s.data(), s.size());
+  }
 }
 
 void process_serial_buffer_for_lines(
-    std::string *from, const std::vector<std::regex> &excludes, bool *drop_continuation) {
+    std::string *from, const std::vector<std::regex> &excludes, bool *drop_continuation, int log_fd,
+    bool mirror_filtered_rx_to_log) {
   /* Do NOT use \\r as a line end (only \\n). Many shells (nsh) use \\r alone for cursor/prompt, so
    * splitting on \\r produced fake short “lines” like "cl" and invalid UTF-8 pieces on screen. */
   for (;;) {
@@ -710,18 +820,18 @@ void process_serial_buffer_for_lines(
     std::string line = from->substr(0, n);
     from->erase(0, n + 1);
     line = strip_trailing_cr(std::move(line));
-    write_filtered_line_to_stdout(line, excludes, drop_continuation);
+    write_filtered_line_to_stdout(line, excludes, drop_continuation, log_fd, mirror_filtered_rx_to_log);
   }
 }
 
 void flush_serial_buffer_idle(std::string *from, const std::vector<std::regex> &excludes,
-                              bool *drop_continuation) {
+                              bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log) {
   if (from->empty()) {
     return;
   }
   std::string chunk = strip_trailing_cr(*from);
   from->clear();
-  write_filtered_chunk_to_stdout(chunk, excludes, drop_continuation);
+  write_filtered_chunk_to_stdout(chunk, excludes, drop_continuation, log_fd, mirror_filtered_rx_to_log);
 }
 
 int run_monitor(const Options &opt) {
@@ -738,17 +848,31 @@ int run_monitor(const Options &opt) {
     }
   }
 
-  int log_fd = -1;
+  /* Without -L: log_sc.fd stays -1 — no open(2), no log file on disk until first Ctrl+A Ctrl+L. */
+  ScopedLogFd log_sc;
   if (!opt.log_path.empty()) {
-    log_fd = open(opt.log_path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
-    if (log_fd < 0) {
+    const int opened = open(opt.log_path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (opened < 0) {
       std::cerr << "open --log " << opt.log_path << ": " << std::strerror(errno) << "\n";
       return 1;
     }
+    log_sc.replace(opened);
   }
-  LogFileGuard log_guard{log_fd};
-  tlog(opt.verbose, "wire log: %s",
-       opt.log_path.empty() ? "(off)" : opt.log_path.c_str());
+  std::string hot_log_dir = ".";
+  std::string hot_log_stem = "ttygg";
+  if (!opt.log_path.empty()) {
+    std::string base;
+    split_dir_and_base(opt.log_path, &hot_log_dir, &base);
+    hot_log_stem = log_stem_from_user_path(base);
+  }
+  unsigned hot_log_next_n = 0;
+  if (opt.log_path.empty()) {
+    tlog(opt.verbose, "wire log: off (no file on disk until Ctrl+A Ctrl+L); then stem=%s dir=%s", hot_log_stem.c_str(),
+         hot_log_dir.c_str());
+  } else {
+    tlog(opt.verbose, "wire log: %s", opt.log_path.c_str());
+    tlog(opt.verbose, "Ctrl+A Ctrl+L template stem=%s dir=%s", hot_log_stem.c_str(), hot_log_dir.c_str());
+  }
 
   int serfd = open_serial_port(opt.port.c_str(), opt.baud, opt.verbose);
   if (serfd < 0) {
@@ -782,12 +906,15 @@ int run_monitor(const Options &opt) {
   const int kPollIdleMs = 200;
   tlog(opt.verbose, "mode: cbreak TX; RX %s; stdin is%sa tty", opt.exclude_patterns.empty() ? "pass (no -e) or line+exclude" : "line+exclude",
        isatty(STDIN_FILENO) ? " " : " not ");
+  if (!opt.exclude_patterns.empty()) {
+    tlog(opt.verbose, "with -e: RX in log file is %s",
+         opt.log_full_rx_wire ? "full wire (--log-full-rx)" : "filtered (terminal view, default)");
+  }
   tlog(opt.verbose, "entering poll loop (timeout %dms per tick)", kPollIdleMs);
   tlog(opt.verbose, "  (all lines prefixed with [ttygg] are on stderr; serial text is on stdout)");
 
   char buf[4096];
   bool picocom_esc_pending = false;
-
   for (;;) {
     int r = poll(pfds, 2, kPollIdleMs);
     if (r < 0) {
@@ -802,7 +929,8 @@ int run_monitor(const Options &opt) {
     if (r == 0) {
       ++poll_idle_streak;
       if (!opt.no_idle_flush && !opt.exclude_patterns.empty()) {
-        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation);
+        const bool mirror_rx = log_sc.fd >= 0 && !opt.log_full_rx_wire;
+        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation, log_sc.fd, mirror_rx);
       }
       if (opt.verbose) {
         if (poll_idle_streak == 1 || poll_idle_streak == 5 ||
@@ -858,8 +986,9 @@ int run_monitor(const Options &opt) {
         }
         ++serial_reads;
         serial_in_total += static_cast<std::uint64_t>(n);
-        if (log_fd >= 0) {
-          log_serial_wire(log_fd, buf, static_cast<size_t>(n));
+        if (log_sc.fd >= 0 &&
+            (opt.exclude_patterns.empty() || opt.log_full_rx_wire)) {
+          log_serial_wire(log_sc.fd, buf, static_cast<size_t>(n));
         }
         tlog_serial_read_hex(opt.verbose, reinterpret_cast<const uint8_t *>(buf),
                              static_cast<size_t>(n));
@@ -873,15 +1002,18 @@ int run_monitor(const Options &opt) {
             return 1;
           }
         } else {
+          const bool mirror_rx = log_sc.fd >= 0 && !opt.log_full_rx_wire;
           from_serial.append(buf, static_cast<size_t>(n));
-          process_serial_buffer_for_lines(&from_serial, compiled, &serial_drop_continuation);
+          process_serial_buffer_for_lines(&from_serial, compiled, &serial_drop_continuation, log_sc.fd,
+                                         mirror_rx);
         }
       }
       /* With -e, line editing (backspace / \\r redraw) has no \\n; waiting only for poll idle (~200ms)
        * made deletes very sluggish. Flush partial after each drain; same risk as idle (UTF-8/ANSI split);
        * use --no-idle-flush to disable both. */
       if (!opt.exclude_patterns.empty() && !opt.no_idle_flush) {
-        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation);
+        const bool mirror_rx = log_sc.fd >= 0 && !opt.log_full_rx_wire;
+        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation, log_sc.fd, mirror_rx);
       }
     }
 
@@ -901,12 +1033,29 @@ int run_monitor(const Options &opt) {
         pfds[0].fd = -1; /* EOF: stop watching stdin, do not exit */
       } else {
         tlog(opt.verbose, "read stdin: %zd bytes, picocom-style to serial", n);
-        if (!process_stdin_picocom_style(serfd, log_fd, buf, static_cast<size_t>(n), &picocom_esc_pending,
-                                         &want_quit, opt.local_echo)) {
+        unsigned rotate_req = 0;
+        if (!process_stdin_picocom_style(serfd, log_sc.fd, buf, static_cast<size_t>(n), &picocom_esc_pending,
+                                         &want_quit, &rotate_req, opt.local_echo)) {
           tlog(opt.verbose, "write stdin to serial failed");
           std::cerr << "write serial: " << std::strerror(errno) << "\n";
           close(serfd);
           return 1;
+        }
+        for (unsigned r = 0; r < rotate_req; r++) {
+          const std::string ts = format_local_yyyymmddhhmmss();
+          unsigned used_n = 0;
+          int new_fd = -1;
+          std::string new_path;
+          std::string oerr;
+          if (!open_exclusive_numbered_log(hot_log_dir, hot_log_stem, hot_log_next_n, ts, &used_n, &new_fd,
+                                           &new_path, &oerr)) {
+            std::cerr << "ttygg: cannot open new wire log: " << oerr << "\n";
+            continue;
+          }
+          hot_log_next_n = used_n + 1;
+          log_sc.replace(new_fd);
+          tlog(opt.verbose, "wire log rotated to %s", new_path.c_str());
+          std::cerr << "ttygg: logging to " << new_path << "\n";
         }
       }
     }
