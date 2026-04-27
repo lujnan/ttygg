@@ -54,11 +54,20 @@ Stack several exclude rules; a line is hidden if it matches **any** pattern:
   -L session.log
 ```
 
-Full options, exit keys (e.g. Ctrl+A then Ctrl+Q), and behaviour notes:
+Full options and behaviour notes:
 
 ```bash
 ./build/ttygg --help
 ```
+
+## Exiting
+
+ttygg uses a **prefix + quit** sequence (picocom-style):
+
+1. Press **Ctrl+A** once (this is the prefix; it is **not** sent to the serial port by itself).
+2. Then press **Ctrl+Q** or **Ctrl+X** to quit the program.
+
+To send a **literal byte 0x01** to the device (e.g. some firmware uses Ctrl+A), press **Ctrl+A** twice in a row: the first is the prefix, the second is forwarded as `0x01`.
 
 ## Environment variables
 
