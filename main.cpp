@@ -66,7 +66,7 @@ struct LocalTermiosGuard {
     }
     struct termios t = saved;
     t.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO | ECHOE | ECHONL | ISIG));
-    /* IXON/IXOFF: driver may take ^Q/^S before read(); must clear for Ctrl+A,Ctrl+Q exit and -i. */
+    /* IXON/IXOFF: driver may take ^Q/^S before read(); must clear for Ctrl+A,Ctrl+Q exit. */
     t.c_iflag &= static_cast<tcflag_t>(~(IXON | IXOFF));
     t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
@@ -202,8 +202,7 @@ void print_help(const char *argv0) {
       << "Exit: Ctrl+A then Ctrl+Q or Ctrl+X (prefix, then quit). Double Ctrl+A sends one literal 0x01 to the port.\n"
       << "With -e, logical lines end on \\n for matching; \\r before \\n stripped. Partial flushes (line editing) run after each serial read batch. If a long line is split across USB reads, a matching exclude is tracked until a \\n so tails are not re-printed; rare false drops if unrelated text follows the same split.\n"
       << "Order: serial to the terminal is applied before the next key is sent, so nsh/line editing redraws stay aligned.\n"
-      << "Non-TTY stdin: no cbreak; keyboard path is best-effort. High non-standard bauds use OS ioctls.\n"
-      << "Legacy flags -i / --interactive are accepted and ignored.\n";
+      << "Non-TTY stdin: no cbreak; keyboard path is best-effort. High non-standard bauds use OS ioctls.\n";
 }
 
 bool parse_u32(const char *s, uint32_t *out) {
@@ -253,11 +252,8 @@ bool parse_args(int argc, char **argv, Options *opt, std::string *err) {
       opt->exclude_patterns.push_back(argv[++i]);
       continue;
     }
-    if (std::strcmp(a, "-i") == 0 || std::strcmp(a, "--interactive") == 0) {
-      continue; /* historic no-op: ttygg is always interactive */
-    }
     if (std::strcmp(a, "--raw") == 0) {
-      *err = "ttygg: --raw is removed; behaviour is the former -i (interactive) only";
+      *err = "ttygg: --raw is removed; interactive cbreak mode is always on";
       return false;
     }
     if (std::strcmp(a, "--eol") == 0) {
