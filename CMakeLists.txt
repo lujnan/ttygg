@@ -1,0 +1,9 @@
+cmake_minimum_required(VERSION 3.10)
+project(ttygg C CXX)
+
+add_executable(ttygg main.cpp)
+target_compile_features(ttygg PRIVATE cxx_std_11)
+if(APPLE)
+  find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
+  target_link_libraries(ttygg PRIVATE ${IOKIT_FRAMEWORK})
+endif()
