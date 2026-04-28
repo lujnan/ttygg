@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 #if defined(__linux__)
-#include <linux/termios.h>
+bool linux_set_nonstandard_baud(int fd, uint32_t baud);
 #endif
 #if defined(__APPLE__)
 #include <IOKit/serial/ioss.h>
@@ -685,20 +685,6 @@ speed_t baud_to_termios_speed(uint32_t baud) {
     return 0;
   }
 }
-
-#if defined(__linux__)
-bool linux_set_nonstandard_baud(int fd, uint32_t baud) {
-  struct termios2 t2;
-  if (ioctl(fd, TCGETS2, &t2) != 0) {
-    return false;
-  }
-  t2.c_cflag &= static_cast<tcflag_t>(~CBAUD);
-  t2.c_cflag |= BOTHER;
-  t2.c_ispeed = baud;
-  t2.c_ospeed = baud;
-  return ioctl(fd, TCSETS2, &t2) == 0;
-}
-#endif
 
 #if defined(__APPLE__)
 bool macos_set_nonstandard_baud(int fd, uint32_t baud) {

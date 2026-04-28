@@ -11,9 +11,7 @@ Interactive mode uses cbreak stdin: each key is forwarded to the serial port (si
 - **CMake** 3.10 or newer
 - A **C++11** compiler
 - **macOS**: links against **IOKit** (for serial port discovery / listing)
-- **Linux**: standard development headers (`termios`, etc.)
-
-**Note:** The **Linux** port has **not** been run or validated on real hardware or in production-like setups yet; treat it as **untested in the field** until you verify it on your machines.
+- **Linux**: standard development headers (`termios`, etc.); builds and runs on common glibc-based systems (including aarch64). Serial listing uses `/dev/ttyUSB*`, `/dev/ttyACM*`, and similar device nodes.
 
 ## Build
 
