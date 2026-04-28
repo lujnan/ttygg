@@ -66,6 +66,52 @@ Full options and behaviour notes:
 ./build/ttygg --help
 ```
 
+## Project-local config (`.ttygg.conf` or `-c`)
+
+The **ttygg binary** does not need to live next to your config: resolution uses your **shell current working directory** (where you run the command), not the directory that holds the executable.
+
+**Two ways to load a config file:**
+
+1. **Implicit:** If you do **not** pass **`-c` / `--config`**, ttygg looks for a file named **`.ttygg.conf`** in the **current working directory** only (again: not relative to the installed binary). If it exists as a regular file, **`key=value`** lines are loaded (`#` starts comments; keys such as `port` / `device`, `baud`, **`exclude_line`** (repeatable), `log`, `log_dir`; `exclude` / `pattern` are accepted as aliases for `exclude_line`).
+2. **Explicit:** **`ttygg --config /path/to/file`** or **`ttygg -c /path/to/file`**. Use any path and filename you like. If **`--config`** is present, ttygg **does not** auto-load `./.ttygg.conf` (only the file you specify). Multiple **`-c`** / **`--config`** arguments can appear; the **last** one wins.
+
+After loading a file (implicit or explicit), **command-line flags still override** the same settings. **`--help`** and **`--list`** do **not** load any config file so broken files cannot block those commands.
+
+Typical implicit workflow: create **`.ttygg.conf`** in a firmware repo, **`cd`** into that repo, run **`ttygg`** from **`PATH`** (no `-p`):
+
+```bash
+cd ~/proj/my-board
+ttygg   # reads ./.ttygg.conf here
+```
+
+Load a fixed profile from elsewhere:
+
+```bash
+ttygg --config ~/proj/my-board/ttygg-board.conf
+```
+
+Example config (save as **`.ttygg.conf`** next to your project or pass via **`--config`**):
+
+```text
+# Rename to ".ttygg.conf" — loaded from the current working directory when you run ttygg
+# unless you pass --help/--list or already pass -p on the command line.
+# Lines are key=value. Leading/trailing spaces are trimmed. Lines starting with # are comments.
+port = /dev/cu.usbserial-1410
+baud = 921600
+# Log directory: creates/opens <log_dir>/ttygg.log (same as -L that path).
+# If you prefer an explicit log file path, use log= instead (and omit log_dir).
+log_dir = ./logs
+exclude_line = ^\s*heartbeat
+exclude_line = SPIFF.*
+# Values may be wrapped in "double" or 'single' quotes; those outer quotes are removed and do not
+# appear in the regex (e.g. exclude_line="hifi4" matches the substring hifi4, not quote characters).
+# Same boolean keys as CLI (optional):
+# verbose = true
+# local_echo = false
+# no_idle_flush = false
+# log_full_rx = false
+```
+
 ## Logging
 
 Use **`-L` / `--log FILE`** to append traffic to a file as **escaped text** (non-printables escaped, newline-terminated records). **Keyboard TX** (what you type toward the serial port) is always logged in full. **Serial RX** in the file depends on filtering:

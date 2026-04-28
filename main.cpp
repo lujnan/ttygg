@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 #include <regex>
 #include <string>
@@ -15,6 +17,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -195,7 +198,14 @@ void print_help(const char *argv0) {
       << "Usage: " << argv0 << " [options]\n"
       << "Interactive serial monitor (cbreak stdin, per-key to port, picocom-style exit). Example:\n"
       << "  " << argv0 << " -p /dev/cu.usbserial-0 -b 921600 -e '...' -L session.log\n"
+      << "Config file (optional): use -c/--config PATH to load key=value settings from PATH. With no -c,\n"
+      << "ttygg loads ./.ttygg.conf from the process current working directory only when that file exists\n"
+      << "(not relative to the ttygg executable). If -c is set, cwd .ttygg.conf is not loaded.\n"
+      << "Typical keys: port (or device), baud, exclude_line (repeatable; alias: exclude, pattern), log,\n"
+      << "log_dir; optional booleans:\n"
+      << "verbose, local_echo, no_idle_flush, log_full_rx. Command-line flags override the file.\n"
       << "\n"
+      << "  -c, --config FILE      Load options from FILE; repeat to use the last FILE. See text above.\n"
       << "  -p, --port DEVICE     Serial device. On macOS use /dev/cu.* (call-out); /dev/tty.* can block in open(2)\n"
       << "                          Linux e.g. /dev/ttyUSB0, /dev/ttyACM0\n"
       << "  -b, --baud RATE        Baud rate (default: 115200)\n"
@@ -229,6 +239,260 @@ bool parse_u32(const char *s, uint32_t *out) {
   return true;
 }
 
+std::string trim_ascii_whitespace(std::string s) {
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) {
+    s.pop_back();
+  }
+  size_t i = 0;
+  while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
+    ++i;
+  return s.substr(i);
+}
+
+void ascii_lowercase_inplace(std::string *s) {
+  for (size_t i = 0; i < s->size(); i++) {
+    unsigned char c = static_cast<unsigned char>((*s)[i]);
+    if (c < 128U) {
+      (*s)[i] = static_cast<char>(std::tolower(c));
+    }
+  }
+}
+
+bool parse_boolish(const std::string &val, bool *out) {
+  std::string v = val;
+  ascii_lowercase_inplace(&v);
+  if (v == "1" || v == "true" || v == "yes" || v == "on") {
+    *out = true;
+    return true;
+  }
+  if (v == "0" || v == "false" || v == "no" || v == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+std::string strip_outer_quotes(std::string v) {
+  v = trim_ascii_whitespace(std::move(v));
+  if (v.size() >= 2U) {
+    const char a = v.front();
+    const char b = v.back();
+    /* Pair of " or ' strips the delimiters only; inner characters are the regex pattern. */
+    if ((a == '"' && b == '"') || (a == '\'' && b == '\'')) {
+      return v.substr(1, v.size() - 2U);
+    }
+  }
+  return v;
+}
+
+std::string join_path_no_dotdot(const std::string &dir, const std::string &rel) {
+  if (dir.empty())
+    return rel;
+  if (!rel.empty() && rel.front() == '/') {
+    return rel;
+  }
+  if (dir.back() == '/') {
+    return dir + rel;
+  }
+  return dir + "/" + rel;
+}
+
+bool getenv_cwd_string(std::string *out) {
+  unsigned cap = 4096;
+  std::vector<char> buf(cap);
+  for (;;) {
+    if (getcwd(buf.data(), buf.size()) != nullptr) {
+      *out = buf.data();
+      return true;
+    }
+    if (errno != ERANGE)
+      return false;
+    buf.resize(buf.size() * 2);
+  }
+}
+
+bool argv_requests_help_or_list_only_quick(int argc, char **argv) {
+  for (int i = 1; i < argc; i++) {
+    const char *a = argv[i];
+    if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0 ||
+        std::strcmp(a, "-l") == 0 || std::strcmp(a, "--list") == 0)
+      return true;
+  }
+  return false;
+}
+
+bool resolve_ttygg_conf_path_for_preload(int argc, char **argv, std::string *path_out, std::string *err) {
+  path_out->clear();
+  if (argv_requests_help_or_list_only_quick(argc, argv)) {
+    return true;
+  }
+
+  std::string last_explicit;
+  for (int i = 1; i < argc; i++) {
+    if (std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "--config") == 0) {
+      if (i + 1 >= argc) {
+        if (err != nullptr) {
+          *err = "Missing value for --config";
+        }
+        return false;
+      }
+      const char *val = argv[i + 1];
+      if (val[0] == '-' && val[1] != '\0') {
+        if (err != nullptr) {
+          *err = "Missing value for --config (next argument looks like an option)";
+        }
+        return false;
+      }
+      last_explicit = val;
+      ++i;
+    }
+  }
+
+  if (!last_explicit.empty()) {
+    *path_out = std::move(last_explicit);
+    return true;
+  }
+
+  std::string cwd;
+  if (!getenv_cwd_string(&cwd)) {
+    return true;
+  }
+  const std::string dot_conf = join_path_no_dotdot(cwd, ".ttygg.conf");
+  struct stat st {};
+  if (stat(dot_conf.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+    *path_out = dot_conf;
+  }
+  return true;
+}
+
+bool load_ttygg_conf(const char *path, Options *opt, std::string *err) {
+  struct stat st {};
+  if (stat(path, &st) != 0) {
+    if (err != nullptr) {
+      *err = std::string("ttygg: ") + path + ": " + std::strerror(errno);
+    }
+    return false;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    if (err != nullptr) {
+      *err = std::string("ttygg: not a regular file: ") + path;
+    }
+    return false;
+  }
+
+  std::ifstream in(path);
+  if (!in) {
+    if (err != nullptr) {
+      *err = std::string("ttygg: cannot read ") + path;
+    }
+    return false;
+  }
+
+  std::string log_dir_from_conf;
+  unsigned line_no = 0;
+  std::string raw;
+  while (std::getline(in, raw)) {
+    ++line_no;
+    if (!raw.empty() && raw.back() == '\r')
+      raw.pop_back();
+
+    /* Strip inline comments: # not inside quotes (simple rule: # after trim starts comment line) */
+    std::string line = trim_ascii_whitespace(raw);
+    if (line.empty())
+      continue;
+    if (line[0] == '#')
+      continue;
+
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) {
+      *err = std::string(path) + ":" + std::to_string(line_no) + ": expected key=value";
+      return false;
+    }
+
+    std::string key = trim_ascii_whitespace(line.substr(0, eq));
+    std::string val = strip_outer_quotes(trim_ascii_whitespace(line.substr(eq + 1)));
+    ascii_lowercase_inplace(&key);
+
+    if (key.empty()) {
+      *err = std::string(path) + ":" + std::to_string(line_no) + ": empty key";
+      return false;
+    }
+
+    if (key == "port" || key == "device") {
+      opt->port = val;
+      continue;
+    }
+    if (key == "baud" || key == "baudrate" || key == "rate") {
+      uint32_t b = 0;
+      if (!parse_u32(val.c_str(), &b)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": invalid baud";
+        return false;
+      }
+      opt->baud = b;
+      continue;
+    }
+    if (key == "log" || key == "log_file" || key == "logfile") {
+      opt->log_path = val;
+      continue;
+    }
+    if (key == "log_dir" || key == "logdir") {
+      log_dir_from_conf = val;
+      continue;
+    }
+    if (key == "exclude_line" || key == "exclude" || key == "pattern") {
+      if (!val.empty())
+        opt->exclude_patterns.push_back(val);
+      continue;
+    }
+    if (key == "verbose") {
+      bool bv = false;
+      if (!parse_boolish(val, &bv)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": verbose expects true/false";
+        return false;
+      }
+      opt->verbose = bv;
+      continue;
+    }
+    if (key == "local_echo" || key == "local-echo") {
+      bool bv = false;
+      if (!parse_boolish(val, &bv)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": local_echo expects true/false";
+        return false;
+      }
+      opt->local_echo = bv;
+      continue;
+    }
+    if (key == "no_idle_flush" || key == "no-idle-flush") {
+      bool bv = false;
+      if (!parse_boolish(val, &bv)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": no_idle_flush expects true/false";
+        return false;
+      }
+      opt->no_idle_flush = bv;
+      continue;
+    }
+    if (key == "log_full_rx" || key == "log-full-rx") {
+      bool bv = false;
+      if (!parse_boolish(val, &bv)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": log_full_rx expects true/false";
+        return false;
+      }
+      opt->log_full_rx_wire = bv;
+      continue;
+    }
+
+    *err = std::string(path) + ":" + std::to_string(line_no) + ": unknown key \"" + key + "\"";
+    return false;
+  }
+
+  /* log_dir: append ttygg.log unless log= was set in this file */
+  if (!log_dir_from_conf.empty() && opt->log_path.empty()) {
+    opt->log_path = join_path_no_dotdot(log_dir_from_conf, "ttygg.log");
+  }
+
+  return true;
+}
+
 bool parse_args(int argc, char **argv, Options *opt, std::string *err) {
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -238,6 +502,19 @@ bool parse_args(int argc, char **argv, Options *opt, std::string *err) {
     }
     if (std::strcmp(a, "-l") == 0 || std::strcmp(a, "--list") == 0) {
       opt->list_ports = true;
+      continue;
+    }
+    if (std::strcmp(a, "-c") == 0 || std::strcmp(a, "--config") == 0) {
+      if (i + 1 >= argc) {
+        *err = "Missing value for --config";
+        return false;
+      }
+      const char *val = argv[i + 1];
+      if (val[0] == '-' && val[1] != '\0') {
+        *err = "Missing value for --config (next argument looks like an option)";
+        return false;
+      }
+      ++i; /* Values were applied in main() before parse_args. */
       continue;
     }
     if (std::strcmp(a, "-p") == 0 || std::strcmp(a, "--port") == 0) {
@@ -312,7 +589,7 @@ bool parse_args(int argc, char **argv, Options *opt, std::string *err) {
     return true;
   }
   if (opt->port.empty()) {
-    *err = "Serial port is required (use -p or --port)";
+    *err = "Serial port is required (use -p/--port, -c/--config, or .ttygg.conf in the working directory)";
     return false;
   }
   return true;
@@ -1079,6 +1356,21 @@ int run_monitor(const Options &opt) {
 int main(int argc, char **argv) {
   Options opt;
   std::string err;
+  {
+    std::string conf_path;
+    if (!resolve_ttygg_conf_path_for_preload(argc, argv, &conf_path, &err)) {
+      std::cerr << err << "\n";
+      print_help(argv[0]);
+      return 2;
+    }
+    if (!conf_path.empty()) {
+      if (!load_ttygg_conf(conf_path.c_str(), &opt, &err)) {
+        std::cerr << err << "\n";
+        print_help(argv[0]);
+        return 2;
+      }
+    }
+  }
   if (!parse_args(argc, argv, &opt, &err)) {
     std::cerr << err << "\n";
     print_help(argv[0]);
