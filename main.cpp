@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <poll.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -799,6 +800,45 @@ int open_serial_port(const char *path, uint32_t baud, bool verbose) {
 }
 
 void glob_append_unique(std::vector<std::string> *out, const char *pattern) {
+#if defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 28)
+  // Android NDK: glob()/globfree() are not available before API 28.
+  // We only need simple patterns like "/dev/ttyUSB*" here.
+  const std::string pat(pattern ? pattern : "");
+  const size_t star = pat.find('*');
+  if (star == std::string::npos) {
+    // No wildcard: append as-is if not present.
+    if (!pat.empty() && std::find(out->begin(), out->end(), pat) == out->end()) {
+      out->push_back(pat);
+    }
+    return;
+  }
+  // Support only a single trailing '*'.
+  if (star + 1 != pat.size()) {
+    return;
+  }
+  const size_t slash = pat.rfind('/', star);
+  const std::string dir = (slash == std::string::npos) ? std::string(".") : pat.substr(0, slash);
+  const std::string prefix = (slash == std::string::npos) ? pat.substr(0, star) : pat.substr(slash + 1, star - (slash + 1));
+
+  DIR *dp = opendir(dir.c_str());
+  if (!dp) {
+    return;
+  }
+  while (struct dirent *de = readdir(dp)) {
+    const char *name = de->d_name;
+    if (!name || name[0] == '.') {
+      continue;
+    }
+    if (std::strncmp(name, prefix.c_str(), prefix.size()) != 0) {
+      continue;
+    }
+    std::string p = (dir == ".") ? std::string(name) : (dir + "/" + name);
+    if (std::find(out->begin(), out->end(), p) == out->end()) {
+      out->push_back(std::move(p));
+    }
+  }
+  closedir(dp);
+#else
   glob_t g;
   memset(&g, 0, sizeof g);
   int gr = glob(pattern, GLOB_NOSORT, nullptr, &g);
@@ -811,6 +851,7 @@ void glob_append_unique(std::vector<std::string> *out, const char *pattern) {
     }
     globfree(&g);
   }
+#endif
 }
 
 void do_list_ports() {
