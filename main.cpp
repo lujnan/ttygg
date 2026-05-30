@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -33,6 +34,8 @@ bool linux_set_nonstandard_baud(int fd, uint32_t baud);
 namespace {
 
 bool write_all(int fd, const char *data, size_t len);
+bool write_serial_to_fd(int fd, const void *p, size_t n, bool with_timestamp);
+bool write_stdout_serial(const void *p, size_t n, bool with_timestamp);
 
 struct Options {
   std::string port;
@@ -44,13 +47,16 @@ struct Options {
   bool verbose = false;
   /// Do not flush partial serial buffer on poll timeout (safer for nsh; long lines without \\n wait for more data).
   bool no_idle_flush = false;
-  /// If non-empty, append a text log of wire TX/RX (see --log) from startup. If empty, no log file is
-  /// opened until the first Ctrl+A Ctrl+L (see run_monitor).
+  /// Log file path template (from log= / log_dir= / -L). Hotkey Ctrl+A Ctrl+L uses its directory and stem.
   std::string log_path;
+  /// If true and log_path is set, open and append at startup; if false, only log_path is kept for the hotkey.
+  bool log_at_start = true;
   /// Echo a copy of bytes we send to the serial to stdout (see --local-echo).
   bool local_echo = false;
   /// With -e: if false (default), RX in the log file matches terminal (--exclude applies). If true, log full RX wire.
   bool log_full_rx_wire = false;
+  /// Prefix serial traffic on stdout and in the wire log with local time (YYYY-MM-DD HH:MM:SS.mmm); see --log-timestamp.
+  bool log_timestamp = false;
 };
 
 struct LocalTermiosGuard {
@@ -118,62 +124,28 @@ void tlog_serial_read_hex(bool verbose, const uint8_t *p, size_t n) {
   std::fflush(stderr);
 }
 
-void append_escaped_to(std::string *out, const unsigned char *b, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    const unsigned c = b[i];
-    switch (c) {
-    case 0:
-      out->append("\\0");
-      break;
-    case '\a':
-      out->append("\\a");
-      break;
-    case '\b':
-      out->append("\\b");
-      break;
-    case '\t':
-      out->append("\\t");
-      break;
-    case '\n':
-      out->append("\\n");
-      break;
-    case '\v':
-      out->append("\\v");
-      break;
-    case '\f':
-      out->append("\\f");
-      break;
-    case '\r':
-      out->append("\\r");
-      break;
-    case '\\':
-      out->append("\\\\");
-      break;
-    default:
-      if (c >= 32U && c < 127U) {
-        out->push_back(static_cast<char>(c));
-      } else if (c >= 128U) {
-        /* UTF-8 and high bytes: keep as-is so log stays readable in UTF-8 locales */
-        out->push_back(static_cast<char>(c));
-      } else {
-        char buf[8];
-        (void)std::snprintf(buf, sizeof buf, "\\x%02x", c);
-        out->append(buf);
-      }
-    }
+std::string format_wire_log_timestamp_prefix() {
+  using clock = std::chrono::system_clock;
+  const auto now = clock::now();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+  const std::time_t t = clock::to_time_t(now);
+  struct tm tm_local {};
+  if (localtime_r(&t, &tm_local) == nullptr) {
+    return "? ";
   }
+  char buf[40];
+  const int n = std::snprintf(buf, sizeof buf, "%04d-%02d-%02d %02d:%02d:%02d.%03d ", tm_local.tm_year + 1900,
+                              tm_local.tm_mon + 1, tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min,
+                              tm_local.tm_sec, static_cast<int>(ms.count()));
+  return n > 0 ? std::string(buf, static_cast<size_t>(n)) : std::string("? ");
 }
 
-void log_serial_wire(int log_fd, const void *p, size_t n) {
+void log_serial_wire(int log_fd, const void *p, size_t n, bool with_timestamp) {
   if (log_fd < 0 || n == 0) {
     return;
   }
-  const auto *b = static_cast<const unsigned char *>(p);
-  std::string line;
-  line.reserve(n * 2 + 8U);
-  append_escaped_to(&line, b, n);
-  line.push_back('\n');
-  (void)write_all(log_fd, line.data(), line.size());
+  (void)write_serial_to_fd(log_fd, p, n, with_timestamp);
 }
 
 struct ScopedLogFd {
@@ -203,8 +175,8 @@ void print_help(const char *argv0) {
       << "ttygg loads ./.ttygg.conf from the process current working directory only when that file exists\n"
       << "(not relative to the ttygg executable). If -c is set, cwd .ttygg.conf is not loaded.\n"
       << "Typical keys: port (or device), baud, exclude_line (repeatable; alias: exclude, pattern), log,\n"
-      << "log_dir; optional booleans:\n"
-      << "verbose, local_echo, no_idle_flush, log_full_rx. Command-line flags override the file.\n"
+      << "log_dir, log_at_start; optional booleans:\n"
+      << "verbose, local_echo, no_idle_flush, log_full_rx, log_timestamp. Command-line flags override the file.\n"
       << "\n"
       << "  -c, --config FILE      Load options from FILE; repeat to use the last FILE. See text above.\n"
       << "  -p, --port DEVICE     Serial device. On macOS use /dev/cu.* (call-out); /dev/tty.* can block in open(2)\n"
@@ -217,15 +189,18 @@ void print_help(const char *argv0) {
       << "      --local-echo        Also print to stdout a copy of everything sent to the serial (if the target does not echo).\n"
       << "  -v, --verbose           Trace run state to stderr. Env TTYGG_DEBUG=1 enables the same.\n"
       << "      --no-idle-flush     With -e: do not flush partial serial→stdout (neither after serial drain nor on poll timeout). TTYGG_NO_IDLE=1 same.\n"
-      << "      --log-full-rx       With -e: write full serial RX to the log file; default is filtered (same as terminal).\n"
-      << "  -L, --log FILE          Append traffic to FILE (escaped text). With -e, RX in the file matches the screen by default.\n"
+      << "      --log-full-rx       With -e: log full serial RX to the file (\\n line splits, --exclude not applied).\n"
+      << "  -L, --log FILE          Append traffic to FILE from startup (same raw text as stdout). With -e, RX in the file matches the screen by default.\n"
+      << "      --no-log            Do not open a log file at startup (log= / log_dir= in config are kept for Ctrl+A Ctrl+L).\n"
+      << "      --log-timestamp     Prefix serial output on stdout and in the wire log with YYYY-MM-DD HH:MM:SS.mmm.\n"
       << "\n"
       << "Stdin is a TTY: cbreak, no local echo, ISIG off, IXON off — each key goes to the port. Add --local-echo if blind.\n"
       << "Exit: Ctrl+A then Ctrl+Q or Ctrl+X (prefix, then quit). Double Ctrl+A sends one literal 0x01 to the port.\n"
       << "Log: Ctrl+A then Ctrl+L starts a new wire log file: {name}_{n}_YYYYMMDDHHMMSS.log (n from 0, skip taken names).\n"
       << "      With no -L, nothing is written to disk until the first Ctrl+A Ctrl+L; then name is ttygg in the current directory.\n"
       << "      With -L PATH, logging starts in PATH immediately; Ctrl+A Ctrl+L uses name/dir from PATH (e.g. a/b/c.log -> a/b/c_n_....log).\n"
-      << "      With -e, use --log-full-rx to log full RX wire in the file (--exclude not applied to RX in file). TX is always full.\n"
+      << "      Config log= / log_dir= without -L: set log_at_start=false to defer disk logging until Ctrl+A Ctrl+L.\n"
+      << "      With -e, use --log-full-rx to log full RX in the file (split on \\n, --exclude not applied). TX is always full.\n"
       << "With -e, logical lines end on \\n for matching; \\r before \\n stripped. Partial flushes (line editing) run after each serial read batch. If a long line is split across USB reads, a matching exclude is tracked until a \\n so tails are not re-printed; rare false drops if unrelated text follows the same split.\n"
       << "Order: serial to the terminal is applied before the next key is sent, so nsh/line editing redraws stay aligned.\n"
       << "Non-TTY stdin: no cbreak; keyboard path is best-effort. High non-standard bauds use OS ioctls.\n";
@@ -481,6 +456,24 @@ bool load_ttygg_conf(const char *path, Options *opt, std::string *err) {
       opt->log_full_rx_wire = bv;
       continue;
     }
+    if (key == "log_timestamp" || key == "log-timestamp") {
+      bool bv = false;
+      if (!parse_boolish(val, &bv)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": log_timestamp expects true/false";
+        return false;
+      }
+      opt->log_timestamp = bv;
+      continue;
+    }
+    if (key == "log_at_start" || key == "log-at-start") {
+      bool bv = false;
+      if (!parse_boolish(val, &bv)) {
+        *err = std::string(path) + ":" + std::to_string(line_no) + ": log_at_start expects true/false";
+        return false;
+      }
+      opt->log_at_start = bv;
+      continue;
+    }
 
     *err = std::string(path) + ":" + std::to_string(line_no) + ": unknown key \"" + key + "\"";
     return false;
@@ -568,16 +561,25 @@ bool parse_args(int argc, char **argv, Options *opt, std::string *err) {
       opt->verbose = true;
       continue;
     }
+    if (std::strcmp(a, "--no-log") == 0) {
+      opt->log_at_start = false;
+      continue;
+    }
     if (std::strcmp(a, "-L") == 0 || std::strcmp(a, "--log") == 0) {
       if (i + 1 >= argc) {
         *err = "Missing value for --log";
         return false;
       }
       opt->log_path = argv[++i];
+      opt->log_at_start = true;
       continue;
     }
     if (std::strcmp(a, "--log-full-rx") == 0) {
       opt->log_full_rx_wire = true;
+      continue;
+    }
+    if (std::strcmp(a, "--log-timestamp") == 0) {
+      opt->log_timestamp = true;
       continue;
     }
     *err = std::string("Unknown option: ") + a;
@@ -884,11 +886,11 @@ std::string strip_trailing_cr(std::string line) {
   return line;
 }
 
-void mirror_tx_to_stdout(bool local_echo, const void *p, size_t n) {
+void mirror_tx_to_stdout(bool local_echo, const void *p, size_t n, bool with_timestamp) {
   if (!local_echo || n == 0) {
     return;
   }
-  (void)write_all(STDOUT_FILENO, static_cast<const char *>(p), n);
+  (void)write_stdout_serial(p, n, with_timestamp);
 }
 
 bool write_all(int fd, const char *data, size_t len) {
@@ -907,6 +909,23 @@ bool write_all(int fd, const char *data, size_t len) {
     len -= static_cast<size_t>(w);
   }
   return true;
+}
+
+bool write_serial_to_fd(int fd, const void *p, size_t n, bool with_timestamp) {
+  if (n == 0) {
+    return true;
+  }
+  if (with_timestamp) {
+    const std::string ts = format_wire_log_timestamp_prefix();
+    if (!write_all(fd, ts.data(), ts.size())) {
+      return false;
+    }
+  }
+  return write_all(fd, static_cast<const char *>(p), n);
+}
+
+bool write_stdout_serial(const void *p, size_t n, bool with_timestamp) {
+  return write_serial_to_fd(STDOUT_FILENO, p, n, with_timestamp);
 }
 
 /* picocom 风格: ^A 为前导; ^A+^Q 或 ^A+^X(picocom 默认) 结束; 连按两次 ^A 发字面 0x01 */
@@ -950,6 +969,84 @@ std::string join_log_dir_file(const std::string &dir, const std::string &filenam
   return dir + "/" + filename;
 }
 
+/* Create path and parents (mode 0755). No-op for "." or empty. */
+bool mkdir_p(const std::string &path, std::string *err) {
+  if (path.empty() || path == ".") {
+    return true;
+  }
+  std::string p = path;
+  while (p.size() > 1 && p.back() == '/') {
+    p.pop_back();
+  }
+  if (p.empty() || p == "/") {
+    return true;
+  }
+
+  std::string built;
+  size_t pos = 0;
+  if (p[0] == '/') {
+    built = "/";
+    pos = 1;
+  }
+  for (;;) {
+    size_t slash = p.find('/', pos);
+    const bool last = slash == std::string::npos;
+    const std::string component = last ? p.substr(pos) : p.substr(pos, slash - pos);
+    if (!component.empty()) {
+      if (built.empty()) {
+        built = component;
+      } else if (built == "/") {
+        built += component;
+      } else {
+        built.push_back('/');
+        built += component;
+      }
+      struct stat st {};
+      if (stat(built.c_str(), &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+          if (err != nullptr) {
+            *err = built + " exists and is not a directory";
+          }
+          return false;
+        }
+      } else if (mkdir(built.c_str(), 0755) != 0 && errno != EEXIST) {
+        if (err != nullptr) {
+          *err = std::strerror(errno);
+        }
+        return false;
+      }
+    }
+    if (last) {
+      break;
+    }
+    pos = slash + 1;
+  }
+  return true;
+}
+
+bool ensure_parent_dir_for_file(const std::string &file_path, std::string *err) {
+  std::string dir;
+  std::string base;
+  split_dir_and_base(file_path, &dir, &base);
+  (void)base;
+  return mkdir_p(dir, err);
+}
+
+bool open_append_log_file(const std::string &path, int *out_fd, std::string *err) {
+  if (!ensure_parent_dir_for_file(path, err)) {
+    return false;
+  }
+  const int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
+  if (fd < 0) {
+    if (err != nullptr) {
+      *err = std::strerror(errno);
+    }
+    return false;
+  }
+  *out_fd = fd;
+  return true;
+}
+
 std::string format_local_yyyymmddhhmmss() {
   const std::time_t t = std::time(nullptr);
   struct tm tm_local {};
@@ -968,6 +1065,9 @@ std::string format_local_yyyymmddhhmmss() {
 bool open_exclusive_numbered_log(const std::string &dir, const std::string &stem, unsigned start_n,
                                  const std::string &timestamp, unsigned *used_n, int *out_fd,
                                  std::string *out_path, std::string *err) {
+  if (!mkdir_p(dir, err)) {
+    return false;
+  }
   for (unsigned n = start_n;; n++) {
     const std::string name = stem + "_" + std::to_string(n) + "_" + timestamp + ".log";
     const std::string path = join_log_dir_file(dir, name);
@@ -986,7 +1086,8 @@ bool open_exclusive_numbered_log(const std::string &dir, const std::string &stem
 }
 
 bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n, bool *esc_pending,
-                                 bool *quit, unsigned *rotate_log_requests, bool local_echo) {
+                                 bool *quit, unsigned *rotate_log_requests, bool local_echo,
+                                 bool log_timestamp) {
   *quit = false;
   if (rotate_log_requests != nullptr) {
     *rotate_log_requests = 0;
@@ -1008,7 +1109,7 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
         if (!write_all(serfd, &b, 1)) {
           return false;
         }
-        mirror_tx_to_stdout(local_echo, &b, 1);
+        mirror_tx_to_stdout(local_echo, &b, 1, log_timestamp);
         for_log.push_back(b);
       }
     } else {
@@ -1016,7 +1117,7 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
       if (c == kPicocomQuitQ || c == kPicocomQuitX) {
         *quit = true;
         if (log_fd >= 0 && !for_log.empty()) {
-          log_serial_wire(log_fd, for_log.data(), for_log.size());
+          log_serial_wire(log_fd, for_log.data(), for_log.size(), log_timestamp);
         }
         return true;
       }
@@ -1026,7 +1127,7 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
           ++*rotate_log_requests;
         }
         if (log_fd >= 0 && !for_log.empty()) {
-          log_serial_wire(log_fd, for_log.data(), for_log.size());
+          log_serial_wire(log_fd, for_log.data(), for_log.size(), log_timestamp);
           for_log.clear();
         }
         continue;
@@ -1036,7 +1137,7 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
         if (!write_all(serfd, &lit, 1)) {
           return false;
         }
-        mirror_tx_to_stdout(local_echo, &lit, 1);
+        mirror_tx_to_stdout(local_echo, &lit, 1, log_timestamp);
         for_log.push_back(lit);
         continue;
       }
@@ -1045,21 +1146,27 @@ bool process_stdin_picocom_style(int serfd, int log_fd, const char *in, size_t n
       if (!write_all(serfd, &prefix, 1) || !write_all(serfd, &ch, 1)) {
         return false;
       }
-      mirror_tx_to_stdout(local_echo, &prefix, 1);
-      mirror_tx_to_stdout(local_echo, &ch, 1);
+      mirror_tx_to_stdout(local_echo, &prefix, 1, log_timestamp);
+      mirror_tx_to_stdout(local_echo, &ch, 1, log_timestamp);
       for_log.push_back(prefix);
       for_log.push_back(ch);
     }
   }
   if (log_fd >= 0 && !for_log.empty()) {
-    log_serial_wire(log_fd, for_log.data(), for_log.size());
+    log_serial_wire(log_fd, for_log.data(), for_log.size(), log_timestamp);
   }
   return true;
 }
 
 void write_filtered_line_to_stdout(const std::string &line,
                                     const std::vector<std::regex> &excludes,
-                                    bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log) {
+                                    bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log,
+                                    bool log_full_rx_to_log, bool log_timestamp) {
+  if (log_full_rx_to_log && log_fd >= 0) {
+    std::string log_out = line;
+    log_out.push_back('\n');
+    log_serial_wire(log_fd, log_out.data(), log_out.size(), log_timestamp);
+  }
   if (drop_continuation != nullptr && *drop_continuation) {
     *drop_continuation = false;
     return;
@@ -1069,9 +1176,9 @@ void write_filtered_line_to_stdout(const std::string &line,
   }
   std::string out = line;
   out.push_back('\n');
-  (void)write_all(STDOUT_FILENO, out.data(), out.size());
+  (void)write_stdout_serial(out.data(), out.size(), log_timestamp);
   if (mirror_filtered_rx_to_log && log_fd >= 0) {
-    log_serial_wire(log_fd, out.data(), out.size());
+    log_serial_wire(log_fd, out.data(), out.size(), log_timestamp);
   }
 }
 
@@ -1079,9 +1186,13 @@ void write_filtered_line_to_stdout(const std::string &line,
  * replacement chars and a messed-up screen (e.g. after "clear"). */
 void write_filtered_chunk_to_stdout(const std::string &chunk,
                                    const std::vector<std::regex> &excludes,
-                                   bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log) {
+                                   bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log,
+                                   bool log_full_rx_to_log, bool log_timestamp) {
   if (chunk.empty()) {
     return;
+  }
+  if (log_full_rx_to_log && log_fd >= 0) {
+    log_serial_wire(log_fd, chunk.data(), chunk.size(), log_timestamp);
   }
   std::string s = chunk;
   if (drop_continuation != nullptr && *drop_continuation) {
@@ -1103,15 +1214,15 @@ void write_filtered_chunk_to_stdout(const std::string &chunk,
     }
     return;
   }
-  (void)write_all(STDOUT_FILENO, s.data(), s.size());
+  (void)write_stdout_serial(s.data(), s.size(), log_timestamp);
   if (mirror_filtered_rx_to_log && log_fd >= 0) {
-    log_serial_wire(log_fd, s.data(), s.size());
+    log_serial_wire(log_fd, s.data(), s.size(), log_timestamp);
   }
 }
 
 void process_serial_buffer_for_lines(
     std::string *from, const std::vector<std::regex> &excludes, bool *drop_continuation, int log_fd,
-    bool mirror_filtered_rx_to_log) {
+    bool mirror_filtered_rx_to_log, bool log_full_rx_to_log, bool log_timestamp) {
   /* Do NOT use \\r as a line end (only \\n). Many shells (nsh) use \\r alone for cursor/prompt, so
    * splitting on \\r produced fake short “lines” like "cl" and invalid UTF-8 pieces on screen. */
   for (;;) {
@@ -1125,18 +1236,21 @@ void process_serial_buffer_for_lines(
     std::string line = from->substr(0, n);
     from->erase(0, n + 1);
     line = strip_trailing_cr(std::move(line));
-    write_filtered_line_to_stdout(line, excludes, drop_continuation, log_fd, mirror_filtered_rx_to_log);
+    write_filtered_line_to_stdout(line, excludes, drop_continuation, log_fd, mirror_filtered_rx_to_log,
+                                log_full_rx_to_log, log_timestamp);
   }
 }
 
 void flush_serial_buffer_idle(std::string *from, const std::vector<std::regex> &excludes,
-                              bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log) {
+                              bool *drop_continuation, int log_fd, bool mirror_filtered_rx_to_log,
+                              bool log_full_rx_to_log, bool log_timestamp) {
   if (from->empty()) {
     return;
   }
   std::string chunk = strip_trailing_cr(*from);
   from->clear();
-  write_filtered_chunk_to_stdout(chunk, excludes, drop_continuation, log_fd, mirror_filtered_rx_to_log);
+  write_filtered_chunk_to_stdout(chunk, excludes, drop_continuation, log_fd, mirror_filtered_rx_to_log,
+                               log_full_rx_to_log, log_timestamp);
 }
 
 int run_monitor(const Options &opt) {
@@ -1153,12 +1267,13 @@ int run_monitor(const Options &opt) {
     }
   }
 
-  /* Without -L: log_sc.fd stays -1 — no open(2), no log file on disk until first Ctrl+A Ctrl+L. */
+  /* log_sc.fd stays -1 until startup open (log_at_start + log_path) or first Ctrl+A Ctrl+L. */
   ScopedLogFd log_sc;
-  if (!opt.log_path.empty()) {
-    const int opened = open(opt.log_path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
-    if (opened < 0) {
-      std::cerr << "open --log " << opt.log_path << ": " << std::strerror(errno) << "\n";
+  if (!opt.log_path.empty() && opt.log_at_start) {
+    int opened = -1;
+    std::string oerr;
+    if (!open_append_log_file(opt.log_path, &opened, &oerr)) {
+      std::cerr << "open --log " << opt.log_path << ": " << oerr << "\n";
       return 1;
     }
     log_sc.replace(opened);
@@ -1174,8 +1289,13 @@ int run_monitor(const Options &opt) {
   if (opt.log_path.empty()) {
     tlog(opt.verbose, "wire log: off (no file on disk until Ctrl+A Ctrl+L); then stem=%s dir=%s", hot_log_stem.c_str(),
          hot_log_dir.c_str());
+  } else if (!opt.log_at_start) {
+    tlog(opt.verbose,
+         "wire log: deferred (--no-log or log_at_start=false); path template %s; Ctrl+A Ctrl+L -> stem=%s dir=%s",
+         opt.log_path.c_str(), hot_log_stem.c_str(), hot_log_dir.c_str());
   } else {
-    tlog(opt.verbose, "wire log: %s", opt.log_path.c_str());
+    tlog(opt.verbose, "wire log: %s%s", opt.log_path.c_str(),
+         opt.log_timestamp ? " (stdout + log timestamps on)" : "");
     tlog(opt.verbose, "Ctrl+A Ctrl+L template stem=%s dir=%s", hot_log_stem.c_str(), hot_log_dir.c_str());
   }
 
@@ -1213,7 +1333,7 @@ int run_monitor(const Options &opt) {
        isatty(STDIN_FILENO) ? " " : " not ");
   if (!opt.exclude_patterns.empty()) {
     tlog(opt.verbose, "with -e: RX in log file is %s",
-         opt.log_full_rx_wire ? "full wire (--log-full-rx)" : "filtered (terminal view, default)");
+         opt.log_full_rx_wire ? "full RX by \\n (--log-full-rx)" : "filtered (terminal view, default)");
   }
   tlog(opt.verbose, "entering poll loop (timeout %dms per tick)", kPollIdleMs);
   tlog(opt.verbose, "  (all lines prefixed with [ttygg] are on stderr; serial text is on stdout)");
@@ -1235,7 +1355,9 @@ int run_monitor(const Options &opt) {
       ++poll_idle_streak;
       if (!opt.no_idle_flush && !opt.exclude_patterns.empty()) {
         const bool mirror_rx = log_sc.fd >= 0 && !opt.log_full_rx_wire;
-        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation, log_sc.fd, mirror_rx);
+        const bool log_full_rx = log_sc.fd >= 0 && opt.log_full_rx_wire;
+        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation, log_sc.fd, mirror_rx,
+                                 log_full_rx, opt.log_timestamp);
       }
       if (opt.verbose) {
         if (poll_idle_streak == 1 || poll_idle_streak == 5 ||
@@ -1291,16 +1413,15 @@ int run_monitor(const Options &opt) {
         }
         ++serial_reads;
         serial_in_total += static_cast<std::uint64_t>(n);
-        if (log_sc.fd >= 0 &&
-            (opt.exclude_patterns.empty() || opt.log_full_rx_wire)) {
-          log_serial_wire(log_sc.fd, buf, static_cast<size_t>(n));
+        if (log_sc.fd >= 0 && opt.exclude_patterns.empty()) {
+          log_serial_wire(log_sc.fd, buf, static_cast<size_t>(n), opt.log_timestamp);
         }
         tlog_serial_read_hex(opt.verbose, reinterpret_cast<const uint8_t *>(buf),
                              static_cast<size_t>(n));
         tlog(opt.verbose, "read serial: +%zd bytes (total in=%llu)", n,
              static_cast<unsigned long long>(serial_in_total));
         if (opt.exclude_patterns.empty()) {
-          if (!write_all(STDOUT_FILENO, buf, static_cast<size_t>(n))) {
+          if (!write_stdout_serial(buf, static_cast<size_t>(n), opt.log_timestamp)) {
             tlog(opt.verbose, "write stdout failed");
             std::cerr << "write stdout: " << std::strerror(errno) << "\n";
             close(serfd);
@@ -1308,9 +1429,10 @@ int run_monitor(const Options &opt) {
           }
         } else {
           const bool mirror_rx = log_sc.fd >= 0 && !opt.log_full_rx_wire;
+          const bool log_full_rx = log_sc.fd >= 0 && opt.log_full_rx_wire;
           from_serial.append(buf, static_cast<size_t>(n));
           process_serial_buffer_for_lines(&from_serial, compiled, &serial_drop_continuation, log_sc.fd,
-                                         mirror_rx);
+                                         mirror_rx, log_full_rx, opt.log_timestamp);
         }
       }
       /* With -e, line editing (backspace / \\r redraw) has no \\n; waiting only for poll idle (~200ms)
@@ -1318,7 +1440,9 @@ int run_monitor(const Options &opt) {
        * use --no-idle-flush to disable both. */
       if (!opt.exclude_patterns.empty() && !opt.no_idle_flush) {
         const bool mirror_rx = log_sc.fd >= 0 && !opt.log_full_rx_wire;
-        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation, log_sc.fd, mirror_rx);
+        const bool log_full_rx = log_sc.fd >= 0 && opt.log_full_rx_wire;
+        flush_serial_buffer_idle(&from_serial, compiled, &serial_drop_continuation, log_sc.fd, mirror_rx,
+                                 log_full_rx, opt.log_timestamp);
       }
     }
 
@@ -1340,7 +1464,7 @@ int run_monitor(const Options &opt) {
         tlog(opt.verbose, "read stdin: %zd bytes, picocom-style to serial", n);
         unsigned rotate_req = 0;
         if (!process_stdin_picocom_style(serfd, log_sc.fd, buf, static_cast<size_t>(n), &picocom_esc_pending,
-                                         &want_quit, &rotate_req, opt.local_echo)) {
+                                         &want_quit, &rotate_req, opt.local_echo, opt.log_timestamp)) {
           tlog(opt.verbose, "write stdin to serial failed");
           std::cerr << "write serial: " << std::strerror(errno) << "\n";
           close(serfd);

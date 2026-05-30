@@ -108,19 +108,24 @@ exclude_line = SPIFF.*
 # local_echo = false
 # no_idle_flush = false
 # log_full_rx = false
+# log_at_start = false   # keep log_dir/log for Ctrl+A Ctrl+L, but do not write until hotkey
 ```
 
 ## Logging
 
-Use **`-L` / `--log FILE`** to append traffic to a file as **escaped text** (non-printables escaped, newline-terminated records). **Keyboard TX** (what you type toward the serial port) is always logged in full. **Serial RX** in the file depends on filtering:
+Use **`-L` / `--log FILE`** to append traffic to a file as **raw text** (same bytes as stdout, including real newlines). **Keyboard TX** (what you type toward the serial port) is always logged in full. **Serial RX** in the file depends on filtering:
+
+**Config `log` / `log_dir` without writing at startup:** set **`log_at_start = false`** in the config file, or pass **`--no-log`** on the command line. The configured path is still used as the template when you press **Ctrl+A** then **Ctrl+L**. Passing **`-L`** on the CLI always opens that file immediately (overrides `--no-log` if both are given, depending on order—put `-L` last if you want immediate logging).
 
 | Mode | RX in log file |
 |------|----------------|
 | No `-e` | Same as stdout: raw RX stream. |
 | With `-e` (default) | Matches the **terminal**: only lines/chunks that are **not** dropped by `--exclude` are written to the log. |
-| With `-e` and `--log-full-rx` | Full **RX wire** in the file; `--exclude` applies only to stdout, not to logged RX. |
+| With `-e` and `--log-full-rx` | Full **RX** in the file, split on `\n` (`--exclude` applies only to stdout, not to logged RX). |
 
-**Without `-L`:** no log file is created until you use the hotkey below. After the first **Ctrl+A** then **Ctrl+L**, logging uses an auto-generated name in the current directory.
+**Without `-L` and without config `log` / `log_dir`:** no log file is created until you use the hotkey below. After the first **Ctrl+A** then **Ctrl+L**, logging uses an auto-generated name in the current directory.
+
+**Parent directories** for `log`, `log_dir`, and hotkey-created files are created automatically if missing.
 
 **With `-L path`:** logging starts immediately, appending to `path`. Each **Ctrl+A** then **Ctrl+L** closes the current log and opens a **new** file. New files are named:
 
